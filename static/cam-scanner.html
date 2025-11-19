@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>QR Code Scanner</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Anti-Counterfeit QR Scanner</h1>
+        
+        <div class="scanner-section">
+            <video id="qr-video" autoplay muted playsinline></video>
+            <div id="cam-has-camera" class="hidden">
+                <p>Camera detected</p>
+            </div>
+            <div id="cam-no-camera" class="hidden">
+                <p>No camera found</p>
+            </div>
+        </div>
+        
+        <div class="manual-section">
+            <h3>Manual Entry</h3>
+            <textarea id="manual-qr" placeholder="Paste QR code text here..." rows="4"></textarea>
+            <button id="verify-manual">Verify Manual Entry</button>
+        </div>
+        
+        <div class="results-section">
+            <div id="local-result" class="result-box hidden">
+                <h3>Local Verification</h3>
+                <div id="local-status"></div>
+            </div>
+            
+            <div id="server-result" class="result-box hidden">
+                <h3>Server Verification</h3>
+                <div id="server-status"></div>
+                <div id="server-details"></div>
+            </div>
+        </div>
+        
+        <div id="error-message" class="error hidden"></div>
+    </div>
+
+    <script type="module">
+        import QrScanner from 'https://cdn.jsdelivr.net/npm/qr-scanner@1.4.2/qr-scanner.min.js';
+        
+        // Public key for local verification (base64url encoded)
+        const PUBLIC_KEY_B64 = '_uPWj0CqM_UhXs2M1JSErtK1lXRMioTazN3r5QwXsiQ'; // From your generator output
+        
+        let qrScanner;
+        let lastScannedQr = '';
+        let scanCooldown = false;
+        
+        // Initialize camera scanner
+        async function initScanner() {
+            const video = document.getElementById('qr-video');
+            const camHasCamera = document.getElementById('cam-has-camera');
+            const camNoCamera = document.getElementById('cam-no-camera');
+            
+            try {
+                qrScanner = new QrScanner(
+                    video,
+                    result => handleQrScan(result.data, result.cornerPoints),
+                    {
+                        onDecodeError: err => {
+                            // Ignore decode errors - they happen constantly while scanning
+                        },
+                        highlightScanRegion: true,
+                        highlightCodeOutline: true,
+                        returnDetailedScanResult: true,
+                    }
+                );
+                
+                await qrScanner.start();
+                camHasCamera.classList.remove('hidden');
+            } catch (error) {
+                console.error('Camera error:', error);
+                camNoCamera.classList.remove('hidden');
+                showError('Camera not available. Use manual entry below.');
+            }
+        }
+        
+        // Handle QR scan result with throttling
+        async function handleQrScan(qrText, cornerPoints) {
+            // Prevent duplicate scans and rapid scanning
+            if (qrText === lastScannedQr || scanCooldown) {
+                return;
+            }
+            
+            lastScannedQr = qrText;
+            scanCooldown = true;
+            
+            console.log('QR scanned:', qrText);
+            console.log('Corner points:', cornerPoints);
+            
+            // Crop QR region using corner points
+            const croppedQR = await cropQRRegion(cornerPoints);
+            await verifyQr(qrText, croppedQR);
+            
+            // Reset cooldown after 3 seconds
+            setTimeout(() => {
+                scanCooldown = false;
+                lastScannedQr = '';
+            }, 3000);
+        }
+        
+        // Local signature verification using Web Crypto API
+        async function verifySignatureLocal(qrText) {
+            try {
+                if (!qrText.includes('.')) {
+                    return { valid: false, error: 'Invalid QR format' };
+                }
+                
+                const [messageB64, signatureB64] = qrText.split('.', 2);
+                
+                // Decode base64url
+                const messageBytes = base64urlDecode(messageB64);
+                const signatureBytes = base64urlDecode(signatureB64);
+                const publicKeyBytes = base64urlDecode(PUBLIC_KEY_B64);
+                
+                // Import Ed25519 public key
+                const publicKey = await crypto.subtle.importKey(
+                    'raw',
+                    publicKeyBytes,
+                    {
+                        name: 'Ed25519',
+                        namedCurve: 'Ed25519'
+                    },
+                    false,
+                    ['verify']
+                );
+                
+                // Verify signature
+                const isValid = await crypto.subtle.verify(
+                    'Ed25519',
+                    publicKey,
+                    signatureBytes,
+                    messageBytes
+                );
+                
+                // Parse payload for display
+                let payload = null;
+                try {
+                    payload = JSON.parse(new TextDecoder().decode(messageBytes));
+                } catch (e) {
+                    // Ignore parse errors
+                }
+                
+                return { valid: isValid, payload };
+                
+            } catch (error) {
+                console.error('Local verification error:', error);
+                return { valid: false, error: error.message };
+            }
+        }
+        
+        // Server verification with optional image
+        async function verifyServer(qrText, cameraImage = null) {
+            try {
+                const requestData = {
+                    qr: qrText,
+                    device: getDeviceId(),
+                    meta: {
+                        userAgent: navigator.userAgent,
+                        timestamp: new Date().toISOString()
+                    }
+                };
+                
+                // Add camera image if available
+                if (cameraImage) {
+                    requestData.meta.image = cameraImage;
+                }
+                
+                const response = await fetch('/verify', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify(requestData)
+                });
+                
+                return await response.json();
+            } catch (error) {
+                console.error('Server verification error:', error);
+                return { ok: false, error: 'network_error', detail: error.message };
+            }
+        }
+        
+        // Crop QR region using corner points with perspective transform
+        async function cropQRRegion(cornerPoints) {
+            try {
+                const video = document.getElementById('qr-video');
+                if (!video || video.videoWidth === 0 || !cornerPoints) {
+                    return null;
+                }
+                
+                // Create canvas to capture full frame
+                const sourceCanvas = document.createElement('canvas');
+                sourceCanvas.width = video.videoWidth;
+                sourceCanvas.height = video.videoHeight;
+                const sourceCtx = sourceCanvas.getContext('2d');
+                sourceCtx.drawImage(video, 0, 0);
+                
+                // Create target canvas for cropped QR (square)
+                const targetSize = 512;
+                const targetCanvas = document.createElement('canvas');
+                targetCanvas.width = targetSize;
+                targetCanvas.height = targetSize;
+                const targetCtx = targetCanvas.getContext('2d');
+                
+                // Simple crop using bounding box (perspective transform is complex in canvas)
+                // Find bounding box of corner points
+                const xs = cornerPoints.map(p => p.x);
+                const ys = cornerPoints.map(p => p.y);
+                const minX = Math.min(...xs);
+                const maxX = Math.max(...xs);
+                const minY = Math.min(...ys);
+                const maxY = Math.max(...ys);
+                
+                const width = maxX - minX;
+                const height = maxY - minY;
+                const size = Math.max(width, height);
+                
+                // Add padding
+                const padding = size * 0.1;
+                const cropX = Math.max(0, minX - padding);
+                const cropY = Math.max(0, minY - padding);
+                const cropSize = size + (padding * 2);
+                
+                // Draw cropped region to target canvas
+                targetCtx.drawImage(
+                    sourceCanvas,
+                    cropX, cropY, cropSize, cropSize,
+                    0, 0, targetSize, targetSize
+                );
+                
+                // Convert to base64 PNG
+                return targetCanvas.toDataURL('image/png');
+                
+            } catch (error) {
+                console.error('QR crop error:', error);
+                return null;
+            }
+        }
+        
+        // Main verification function
+        async function verifyQr(qrText, cameraImage = null) {
+            clearResults();
+            
+            // Show local verification first
+            const localResult = await verifySignatureLocal(qrText);
+            showLocalResult(localResult);
+            
+            // Then server verification with image
+            const serverResult = await verifyServer(qrText, cameraImage);
+            showServerResult(serverResult);
+        }
+        
+        // Display local verification result
+        function showLocalResult(result) {
+            const localResultDiv = document.getElementById('local-result');
+            const localStatus = document.getElementById('local-status');
+            
+            localResultDiv.classList.remove('hidden');
+            
+            if (result.valid) {
+                localStatus.innerHTML = `
+                    <div class="status-authentic">✓ SIGNATURE VALID</div>
+                    ${result.payload ? `<div class="payload">Serial: ${result.payload.s}</div>` : ''}
+                `;
+            } else {
+                localStatus.innerHTML = `
+                    <div class="status-invalid">✗ SIGNATURE INVALID</div>
+                    <div class="error-detail">${result.error || 'Local verification failed'}</div>
+                `;
+            }
+        }
+        
+        // Display server verification result
+        function showServerResult(result) {
+            const serverResultDiv = document.getElementById('server-result');
+            const serverStatus = document.getElementById('server-status');
+            const serverDetails = document.getElementById('server-details');
+            
+            serverResultDiv.classList.remove('hidden');
+            
+            if (result.ok) {
+                const statusClass = result.flagged ? 'status-flagged' : 
+                                  result.visual_tamper ? 'status-tampered' : 'status-authentic';
+                const statusText = result.flagged ? 'FLAGGED - SUSPICIOUS ACTIVITY' :
+                                 result.visual_tamper ? 'NOT AUTHENTIC - VISUAL TAMPERING' : 'AUTHENTIC';
+                
+                serverStatus.innerHTML = `<div class="${statusClass}">✓ ${statusText}</div>`;
+                serverDetails.innerHTML = `
+                    <div class="details">
+                        <p><strong>Serial:</strong> ${result.serial}</p>
+                        <p><strong>Product:</strong> ${result.payload?.p || 'N/A'}</p>
+                        <p><strong>Batch:</strong> ${result.payload?.b || 'N/A'}</p>
+                        <p><strong>Scan Count:</strong> ${result.scans}</p>
+                        <p><strong>Similarity:</strong> ${(result.similarity * 100).toFixed(1)}%</p>
+                    </div>
+                `;
+            } else {
+                serverStatus.innerHTML = `<div class="status-invalid">✗ NOT AUTHENTIC</div>`;
+                serverDetails.innerHTML = `
+                    <div class="error-detail">
+                        <p><strong>Error:</strong> ${result.error}</p>
+                        <p><strong>Detail:</strong> ${result.detail}</p>
+                    </div>
+                `;
+            }
+        }
+        
+        // Utility functions
+        function base64urlDecode(str) {
+            // Add padding if needed
+            str += '='.repeat((4 - str.length % 4) % 4);
+            // Convert base64url to base64
+            str = str.replace(/-/g, '+').replace(/_/g, '/');
+            // Decode
+            const binary = atob(str);
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+            }
+            return bytes;
+        }
+        
+        function getDeviceId() {
+            let deviceId = localStorage.getItem('deviceId');
+            if (!deviceId) {
+                deviceId = 'web_' + Math.random().toString(36).substr(2, 9);
+                localStorage.setItem('deviceId', deviceId);
+            }
+            return deviceId;
+        }
+        
+        function clearResults() {
+            document.getElementById('local-result').classList.add('hidden');
+            document.getElementById('server-result').classList.add('hidden');
+            document.getElementById('error-message').classList.add('hidden');
+        }
+        
+        function showError(message) {
+            const errorDiv = document.getElementById('error-message');
+            errorDiv.textContent = message;
+            errorDiv.classList.remove('hidden');
+        }
+        
+        // Manual entry handler (no image capture for manual entry)
+        document.getElementById('verify-manual').addEventListener('click', () => {
+            const qrText = document.getElementById('manual-qr').value.trim();
+            if (qrText) {
+                verifyQr(qrText, null); // No camera image for manual entry
+            } else {
+                showError('Please enter QR code text');
+            }
+        });
+        
+        // Initialize on page load
+        window.addEventListener('load', initScanner);
+        
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            if (qrScanner) {
+                qrScanner.destroy();
+            }
+        });
+    </script>
+</body>
+</html>
